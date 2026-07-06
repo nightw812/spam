@@ -1,0 +1,95 @@
+from telethon import TelegramClient
+from telebot import TeleBot
+import asyncio
+import threading
+from asyncio import Queue
+
+# ================= НАСТРОЙКИ =================
+api_id = 12345678
+api_hash = 'твой_api_hash'
+phone = '+79123456789'
+
+BOT_TOKEN = '123456:ABC-DEF...'   
+
+# Разрешённые группы
+ALLOWED_GROUPS = {
+    "main": -1001234567890,
+    "chat": -1009876543210,
+    "test": "@testgroupusername",
+    # Добавляй свои группы сюда
+}
+# ============================================
+
+user_client = TelegramClient('user_session', api_id, api_hash)
+bot = TeleBot(BOT_TOKEN)
+
+# Очередь сообщений
+message_queue = Queue()
+
+async def queue_worker():
+    """Фоновая задача: отправляет сообщения по одному с задержкой"""
+    print("🔄 Очередь отправки запущена (кулдаун 5 сек)")
+    while True:
+        # Берём задачу из очереди
+        group_key, text = await message_queue.get()
+        
+        try:
+            target = ALLOWED_GROUPS[group_key]
+            await user_client.send_message(target, text)
+            print(f"✅ Отправлено в {group_key}: {text[:50]}...")
+        except Exception as e:
+            print(f"❌ Ошибка отправки в {group_key}: {e}")
+        
+        await asyncio.sleep(5)  # Кулдаун 5 секунд
+        message_queue.task_done()
+
+
+@bot.message_handler(commands=['send'])
+def send_message(message):
+    try:
+        args = message.text.split(maxsplit=2)
+        if len(args) < 3:
+            bot.reply_to(message, "❌ Использование:\n`/send имя_группы текст`")
+            return
+
+        group_key = args[1].lower()
+        text = args[2]
+
+        if group_key not in ALLOWED_GROUPS:
+            bot.reply_to(message, f"❌ Группа `{group_key}` не найдена.\nДоступно: {list(ALLOWED_GROUPS.keys())}")
+            return
+
+        # Добавляем в очередь
+        asyncio.run_coroutine_threadsafe(
+            message_queue.put((group_key, text)), 
+            loop
+        )
+        
+        bot.reply_to(message, f"📥 Задача добавлена в очередь ({message_queue.qsize()} в очереди)\nОтправка в **{group_key}** через ~5 сек...")
+
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
+
+
+async def main():
+    global loop
+    loop = asyncio.get_running_loop()
+    
+    # Запуск Userbot
+    print("🚀 Запуск Userbot...")
+    await user_client.start(phone=phone)
+    print("✅ Userbot авторизован")
+    
+    # Запуск очереди
+    asyncio.create_task(queue_worker())
+    
+    # Запуск бота
+    print("🤖 Запуск бота...")
+    threading.Thread(target=bot.infinity_polling, daemon=True).start()
+    
+    print("\n✅ Всё готово! Используй /send имя_группы текст")
+    await asyncio.Event().wait()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
