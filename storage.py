@@ -1,39 +1,3 @@
-"""
-JSON-хранилище на пользователя + отдельный глобальный реестр номеров телефонов.
-
-Структура user-записи:
-{
-  "accounts": [
-      {
-        "index": int,
-        "phone": str,
-        "groups": [{"id":.., "name":..}],
-        "selected": [id, ...],
-        "interval": int | None,      # секунды повтора; None/0 = отправка один раз
-        "delay": {"min": float, "max": float},  # случайная пауза между сообщениями, сек.
-        "content_type": "text" | "photo" | "photo_text" | "forward" | None,
-        "content_text": str | None,
-        "content_photo": str | None,           # путь к файлу на диске
-        "content_forward_chat_id": int | None, # источник для пересылки
-        "content_forward_message_id": int | None,
-        "stat_sent": int,             # сколько сообщений успешно отправлено (всего)
-        "stat_errors": int,           # сколько ошибок при отправке (всего)
-      },
-      ...
-  ],
-  "broadcast_accounts": [int, ...],   # какие аккаунты реально рассылают (галочки в "аккаунт")
-  "delay_between_accounts": float,    # пауза между стартом рассылки у разных аккаунтов, сек.
-  "settings_account": int | None,     # какой номер сейчас открыт в разделе "настройка"
-  "groups_account": int | None,       # какой номер сейчас открыт в разделе "группы"
-  "content_account": int | None,      # какой номер сейчас открыт в разделе "контент"
-  "schedule": [{"id": int, "days": [0-6] (пусто = каждый день), "start": "HH:MM", "end": "HH:MM"}],
-  "schedule_enabled": bool,
-}
-
-Отдельно, в PHONES_FILE, хранится глобальный реестр номеров вида:
-{ "+79991234567": {"user_id": 111, "account_index": 0}, ... }
-"""
-
 import json
 import os
 from threading import Lock
@@ -93,7 +57,19 @@ def get_user_data(user_id: int) -> dict:
         acc.setdefault("delay", dict(_DEFAULT_DELAY))
         for k, v in _DEFAULT_ACCOUNT_EXTRA.items():
             acc.setdefault(k, v)
-        # миграция старых записей расписания (time -> start/end)
+        # === ДОБАВЛЯЕМ МИГРАЦИЮ ДЛЯ INTERVAL ===
+        if acc["interval"] is not None:
+            # Если interval это int, преобразуем в dict
+            if isinstance(acc["interval"], int):
+                val = acc["interval"]
+                acc["interval"] = {"min": val, "max": val}
+            # Если это dict, проверяем ключи
+            elif isinstance(acc["interval"], dict):
+                if "min" not in acc["interval"]:
+                    acc["interval"]["min"] = acc["interval"].get("max", 0)
+                if "max" not in acc["interval"]:
+                    acc["interval"]["max"] = acc["interval"].get("min", 0)
+    # ... остальной код ...
     user.setdefault("broadcast_accounts", [])
     user.setdefault("delay_between_accounts", 0)
     user.setdefault("settings_account", None)
@@ -103,7 +79,6 @@ def get_user_data(user_id: int) -> dict:
     user.setdefault("schedule_enabled", False)
     for entry in user["schedule"]:
         if "start" not in entry:
-            # миграция старого формата {"time": "HH:MM"} -> окно того же времени
             t = entry.pop("time", "00:00")
             entry["start"] = t
             entry["end"] = t
@@ -117,6 +92,14 @@ def get_user_data(user_id: int) -> dict:
         user["groups_account"] = next(iter(existing), None)
     if user["content_account"] not in existing:
         user["content_account"] = next(iter(existing), None)
+
+    # Ограничиваем количество групп до MAX_GROUPS_PER_ACCOUNT
+    for acc in user["accounts"]:
+        if len(acc.get("groups", [])) > config.MAX_GROUPS_PER_ACCOUNT:
+            acc["groups"] = acc["groups"][:config.MAX_GROUPS_PER_ACCOUNT]
+        if len(acc.get("selected", [])) > config.MAX_GROUPS_PER_ACCOUNT:
+            acc["selected"] = acc["selected"][:config.MAX_GROUPS_PER_ACCOUNT]
+
     return user
 
 
@@ -144,6 +127,11 @@ def next_account_index(user_id: int) -> int:
 
 def add_account(user_id: int, index: int, phone: str):
     user = get_user_data(user_id)
+
+    # Проверка на максимальное количество аккаунтов
+    if len(user["accounts"]) >= config.MAX_ACCOUNTS_PER_USER:
+        raise ValueError(f"Максимум {config.MAX_ACCOUNTS_PER_USER} аккаунтов на пользователя")
+
     acc = {
         "index": index,
         "phone": phone,
@@ -228,7 +216,7 @@ def session_key(user_id: int, account_index: int) -> str:
     return f"{user_id}_{account_index}"
 
 
-# ---------- реестр телефонных номеров (глобальный, across всех пользователей бота) ----------
+# ---------- реестр телефонных номеров ----------
 
 def _load_phones():
     if not os.path.exists(config.PHONES_FILE):
@@ -262,7 +250,7 @@ def unregister_phone(phone: str):
         _save_phones(data)
 
 
-# ---------- расписание (окна времени: начало-конец) ----------
+# ---------- расписание ----------
 
 def next_schedule_id(user_id: int) -> int:
     user = get_user_data(user_id)
