@@ -7,7 +7,7 @@
  🗓 расписание рассылок
  ❓ FAQ
 
-Доступ только для ID из config.ALLOWED_USER_IDS.
+Доступ для всех пользователей.
 Каждый пользователь работает ТОЛЬКО со своими собственными Telegram-аккаунтами
 (можно добавить несколько). Если аккаунт один — рассылка всегда идёт через него.
 Если аккаунтов два и больше — какие из них реально рассылают, отмечается прямо
@@ -25,7 +25,11 @@ try:
     from zoneinfo import ZoneInfo
     MSK = ZoneInfo("Europe/Moscow")
 except Exception:
+    # На случай, если база часовых поясов недоступна (например, "голый" Windows
+    # без пакета tzdata) — используем фиксированное смещение. Россия не переходит
+    # на летнее/зимнее время с 2014 года, так что UTC+3 для MSK надёжно всегда.
     MSK = timezone(timedelta(hours=3))
+
 
 def now_msk() -> datetime:
     return datetime.now(MSK)
@@ -39,21 +43,19 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
-    FloodWaitError,
 )
 
 import config
 import storage
-import spintext
+import spintax
 import userbot_manager as ub
-import keyboards as kb  # ← ИМПОРТИРУЕМ из keyboards.py
+import keyboards as kb
 from emoji_utils import emoji
-
-# ... ОСТАЛЬНОЙ КОД main.py (без дублирования клавиатур!)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -86,8 +88,11 @@ class ScheduleStates(StatesGroup):
     waiting_end_time = State()               # data: days=[int,...], start="HH:MM"
 
 
-# ---------- безопасные edit_text/edit_reply_markup ----------
+class AdminStates(StatesGroup):
+    waiting_broadcast_message = State()
 
+
+# ---------- безопасные edit_text/edit_reply_markup ----------
 async def safe_edit_text(message: Message, text: str, reply_markup=None, parse_mode=None):
     """
     Обёртка над message.edit_text, которая не падает, если:
@@ -117,42 +122,7 @@ async def safe_edit_reply_markup(message: Message, reply_markup=None):
 
 
 # ---------- парсинг/форматирование ----------
-
-def parse_interval(text: str) -> dict | None:
-    """
-    Парсит интервал. Поддерживает два формата:
-    - Фиксированный: 0:1:15
-    - Рандомный: 0:1:15-0:1:20
-
-    Возвращает dict {"min": seconds, "max": seconds} или None при ошибке.
-    """
-    text = text.strip()
-
-    # Проверяем, есть ли диапазон
-    if "-" in text:
-        parts = text.split("-")
-        if len(parts) != 2:
-            return None
-
-        min_val = _parse_single_interval(parts[0])
-        max_val = _parse_single_interval(parts[1])
-
-        if min_val is None or max_val is None:
-            return None
-
-        if min_val > max_val:
-            min_val, max_val = max_val, min_val
-
-        return {"min": min_val, "max": max_val}
-    else:
-        val = _parse_single_interval(text)
-        if val is None:
-            return None
-        return {"min": val, "max": val}
-
-
-def _parse_single_interval(text: str) -> int | None:
-    """Парсит один интервал в формате часы:минуты:секунды."""
+def parse_interval(text: str) -> int | None:
     parts = text.strip().split(":")
     if len(parts) != 3:
         return None
@@ -166,28 +136,6 @@ def _parse_single_interval(text: str) -> int | None:
     if total <= 0:
         return None
     return total
-
-
-def format_interval(interval_spec: dict) -> str:
-    """Форматирует интервал для отображения пользователю."""
-    if not interval_spec:
-        return "не задан (отправка один раз)"
-
-    min_val = interval_spec.get("min", 0)
-    max_val = interval_spec.get("max", 0)
-
-    h, rem = divmod(int(min_val), 3600)
-    m, s = divmod(rem, 60)
-    min_str = f"{h}:{m:02d}:{s:02d}"
-
-    if min_val == max_val:
-        return min_str
-
-    h, rem = divmod(int(max_val), 3600)
-    m, s = divmod(rem, 60)
-    max_str = f"{h}:{m:02d}:{s:02d}"
-
-    return f"{min_str}–{max_str} (случайно)"
 
 
 def format_interval(total_seconds) -> str:
@@ -272,40 +220,39 @@ def _content_back_target(user: dict) -> str:
 
 
 def _extract_forward_origin(message: Message):
-    """
-    Возвращает (chat_id, message_id) исходного сообщения.
-    Теперь работает даже если пересылка запрещена — пытается найти источник
-    любым доступным способом.
-    """
-    # Способ 1: через forward_origin (новый API)
+    """Возвращает (chat_id, message_id) исходного сообщения, если пересылка
+    доступна для повторной пересылки, иначе (None, None)."""
     origin = getattr(message, "forward_origin", None)
     if origin is not None:
-        chat = getattr(origin, "chat", None)
-        msg_id = getattr(origin, "message_id", None)
-        if chat is not None and msg_id is not None:
-            return chat.id, msg_id
-
-    # Способ 2: через forward_from_chat (старый API)
+        # Проверяем тип источника пересылки
+        origin_type = type(origin).__name__
+        
+        if origin_type == "MessageOriginChannel":
+            # Пересылка из канала
+            chat = getattr(origin, "chat", None)
+            msg_id = getattr(origin, "message_id", None)
+            if chat is not None and msg_id is not None:
+                return chat.id, msg_id
+        elif origin_type == "MessageOriginChat":
+            # Пересылка из группы
+            chat = getattr(origin, "chat", None)
+            msg_id = getattr(origin, "message_id", None)
+            if chat is not None and msg_id is not None:
+                return chat.id, msg_id
+        elif origin_type == "MessageOriginUser":
+            # Пересылка от пользователя - нельзя переслать повторно через forward_messages
+            # Telethon не поддерживает пересылку от пользователя напрямую
+            return None, None
+        elif origin_type == "MessageOriginHiddenUser":
+            # Скрытый пользователь - нельзя переслать
+            return None, None
+        
+        return None, None
+    
+    # Fallback для старых версий aiogram
     if message.forward_from_chat and message.forward_from_message_id:
         return message.forward_from_chat.id, message.forward_from_message_id
-
-    # Способ 3: если переслано от пользователя
-    if message.forward_from and message.forward_from_message_id:
-        return message.forward_from.id, message.forward_from_message_id
-
-    # Способ 4: если переслано из канала с подписью
-    if hasattr(message, "forward_sender_name") and message.forward_sender_name:
-        # В этом случае мы не можем определить chat_id, но можем попробовать
-        # использовать медиа-группу или другие поля
-        pass
-
-    # Способ 5: пробуем найти через reply_to_message (если есть)
-    if message.reply_to_message:
-        reply = message.reply_to_message
-        if reply.chat and reply.message_id:
-            # Если это ответ на сообщение, можно использовать его как источник
-            return reply.chat.id, reply.message_id
-
+    
     return None, None
 
 
@@ -317,7 +264,13 @@ pending_qr_logins: dict[int, dict] = {}
 
 
 def allowed(user_id: int) -> bool:
-    return user_id in config.ALLOWED_USER_IDS
+    # Доступ для всех пользователей
+    return True
+
+
+def is_admin(user_id: int) -> bool:
+    # Проверка на админа
+    return user_id == config.ADMIN_ID
 
 
 async def _canonical_phone(client) -> str:
@@ -325,26 +278,7 @@ async def _canonical_phone(client) -> str:
     return f"+{me.phone}" if me and me.phone else "неизвестный номер"
 
 
-# ---------- Доступ ----------
-
-@router.message.middleware()
-async def access_middleware(handler, event: Message, data):
-    if not allowed(event.from_user.id):
-        await event.answer("У вас нет доступа к этому боту. Обратитесь к администратору.")
-        return
-    return await handler(event, data)
-
-
-@router.callback_query.middleware()
-async def access_middleware_cb(handler, event: CallbackQuery, data):
-    if not allowed(event.from_user.id):
-        await event.answer("Нет доступа", show_alert=True)
-        return
-    return await handler(event, data)
-
-
 # ---------- Главное меню ----------
-
 async def _abandon_pending_login(user_id: int, state: FSMContext):
     """
     Прерывает незавершённую попытку входа (QR или по номеру+коду) и сбрасывает
@@ -367,6 +301,8 @@ async def _abandon_pending_login(user_id: int, state: FSMContext):
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
+    # Регистрируем первого запуска пользователя
+    storage.mark_user_started(message.from_user.id)
     await message.answer(f"{emoji('circle')} Меню:", reply_markup=kb.main_menu(), parse_mode="HTML")
 
 
@@ -390,7 +326,6 @@ async def cb_noop(call: CallbackQuery):
 
 
 # ---------- Статистика ----------
-
 @router.callback_query(F.data == "menu_statistics")
 async def cb_menu_statistics(call: CallbackQuery):
     user = storage.get_user_data(call.from_user.id)
@@ -410,6 +345,7 @@ async def cb_menu_statistics(call: CallbackQuery):
     )
     await safe_edit_text(call.message, text, reply_markup=kb.back_button("menu_main"), parse_mode="HTML")
 
+
 @router.callback_query(F.data == "menu_account")
 async def cb_menu_account(call: CallbackQuery):
     if _bot_running(call.from_user.id):
@@ -422,10 +358,11 @@ async def cb_menu_account(call: CallbackQuery):
         else:
             text = (
                 f"Аккаунтов подключено: {len(user['accounts'])}\n"
-                f"Отметьте галочками, какие будут рассылать при ▶️ старт."
+                f"Отметьте галочками, какие будут рассылать при ▶️ старт.\n"
+                f"Максимум {config.MAX_ACCOUNTS_PER_USER} аккаунта на пользователя."
             )
     else:
-        text = "Аккаунтов пока нет. Добавь свой первый аккаунт."
+        text = f"Аккаунтов пока нет. Добавь свой первый аккаунт (максимум {config.MAX_ACCOUNTS_PER_USER})."
     await safe_edit_text(
         call.message, text, reply_markup=kb.account_menu(user["accounts"], user["broadcast_accounts"])
     )
@@ -435,6 +372,12 @@ async def cb_menu_account(call: CallbackQuery):
 async def cb_account_add(call: CallbackQuery, state: FSMContext):
     await state.clear()
     user_id = call.from_user.id
+    
+    # Проверка лимита аккаунтов
+    user = storage.get_user_data(user_id)
+    if len(user["accounts"]) >= config.MAX_ACCOUNTS_PER_USER:
+        await call.answer(f"Максимум {config.MAX_ACCOUNTS_PER_USER} аккаунта на пользователя.", show_alert=True)
+        return
 
     old = pending_qr_logins.pop(user_id, None)
     if old:
@@ -464,19 +407,6 @@ async def _send_qr(bot: Bot, chat_id: int, url: str, caption: str):
 
 async def _finish_login(user_id: int, account_index: int, key: str, client, bot: Bot, chat_id: int):
     phone = await _canonical_phone(client)
-
-    # Проверяем, не превышен ли лимит аккаунтов
-    user = storage.get_user_data(user_id)
-    if len(user["accounts"]) >= config.MAX_ACCOUNTS_PER_USER:
-        await bot.send_message(
-            chat_id,
-            f"⚠️ Достигнут лимит аккаунтов ({config.MAX_ACCOUNTS_PER_USER}). "
-            f"Удалите один из существующих аккаунтов, чтобы добавить новый.",
-            reply_markup=kb.main_menu(),
-        )
-        await ub.discard_client(key)
-        return
-
     if storage.is_phone_registered(phone):
         try:
             await ub.logout(key)
@@ -489,7 +419,6 @@ async def _finish_login(user_id: int, account_index: int, key: str, client, bot:
             reply_markup=kb.main_menu(),
         )
         return
-
     storage.add_account(user_id, account_index, phone)
     await bot.send_message(chat_id, f"Аккаунт {phone} подключён ✅", reply_markup=kb.main_menu())
 
@@ -512,12 +441,10 @@ async def _qr_login_flow(user_id: int, account_index: int, key: str, client, bot
         except asyncio.TimeoutError:
             pending_qr_logins.pop(user_id, None)
             await ub.discard_client(key)
-            # Удаляем QR-код
-            if msg:
-                try:
-                    await bot.delete_message(chat_id, msg.message_id)
-                except Exception:
-                    pass
+            try:
+                await bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
             await bot.send_message(
                 chat_id,
                 "Время сканирования истекло. Нажмите «➕ добавить аккаунт (QR)» ещё раз.",
@@ -525,12 +452,10 @@ async def _qr_login_flow(user_id: int, account_index: int, key: str, client, bot
             )
             return
         except SessionPasswordNeededError:
-            # Удаляем QR-код
-            if msg:
-                try:
-                    await bot.delete_message(chat_id, msg.message_id)
-                except Exception:
-                    pass
+            try:
+                await bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
             await bot.send_message(
                 chat_id,
                 "На этом аккаунте включён пароль (2FA). Отправьте его сообщением "
@@ -541,20 +466,8 @@ async def _qr_login_flow(user_id: int, account_index: int, key: str, client, bot
     except Exception as e:
         pending_qr_logins.pop(user_id, None)
         await ub.discard_client(key)
-        if msg:
-            try:
-                await bot.delete_message(chat_id, msg.message_id)
-            except Exception:
-                pass
         await bot.send_message(chat_id, f"Ошибка входа: {e}")
         return
-
-    # QR-код успешно отсканирован — удаляем его
-    if msg:
-        try:
-            await bot.delete_message(chat_id, msg.message_id)
-        except Exception:
-            pass
 
     pending_qr_logins.pop(user_id, None)
     await _finish_login(user_id, account_index, key, client, bot, chat_id)
@@ -580,6 +493,12 @@ async def process_qr_password(message: Message):
 
 @router.callback_query(F.data == "account_add_phone")
 async def cb_account_add_phone(call: CallbackQuery, state: FSMContext):
+    # Проверка лимита аккаунтов
+    user = storage.get_user_data(call.from_user.id)
+    if len(user["accounts"]) >= config.MAX_ACCOUNTS_PER_USER:
+        await call.answer(f"Максимум {config.MAX_ACCOUNTS_PER_USER} аккаунта на пользователя.", show_alert=True)
+        return
+    
     old = pending_qr_logins.pop(call.from_user.id, None)
     if old:
         if not old["task"].done():
@@ -599,6 +518,13 @@ async def cb_account_add_phone(call: CallbackQuery, state: FSMContext):
 
 @router.message(AccountStates.waiting_phone)
 async def process_phone(message: Message, state: FSMContext):
+    # Проверка лимита аккаунтов
+    user = storage.get_user_data(message.from_user.id)
+    if len(user["accounts"]) >= config.MAX_ACCOUNTS_PER_USER:
+        await message.answer(f"Максимум {config.MAX_ACCOUNTS_PER_USER} аккаунта на пользователя.")
+        await state.clear()
+        return
+    
     phone = message.text.strip()
     account_index = storage.next_account_index(message.from_user.id)
     key = storage.session_key(message.from_user.id, account_index)
@@ -620,6 +546,8 @@ async def process_phone(message: Message, state: FSMContext):
 async def process_code(message: Message, state: FSMContext):
     data = await state.get_data()
     code = message.text.strip()
+    # Удаляем точку из кода (например, 12.345 -> 12345)
+    code = code.replace(".", "")
     key = storage.session_key(message.from_user.id, data["account_index"])
     try:
         await ub.sign_in_code(key, data["phone"], code, data["phone_code_hash"])
@@ -692,7 +620,6 @@ async def cb_account_remove(call: CallbackQuery):
 
 
 # ---------- Группы (у каждого аккаунта — свои, с постраничным списком) ----------
-
 async def _show_groups_menu(call: CallbackQuery, index: int):
     user = storage.get_user_data(call.from_user.id)
     acc = storage.get_account(call.from_user.id, index)
@@ -758,7 +685,8 @@ async def cb_groups_load(call: CallbackQuery):
     user = storage.get_user_data(call.from_user.id)
     await safe_edit_text(
         call.message,
-        f"Готово. Загружено: {len(groups)} групп(ы), в которые есть право писать.",
+        f"Готово. Загружено: {len(groups)} групп(ы), в которые есть право писать.\n"
+        f"Максимум {config.MAX_GROUPS_PER_ACCOUNT} групп для отправки.",
         reply_markup=kb.groups_menu(index, _groups_back_target(user)),
     )
 
@@ -772,7 +700,8 @@ async def cb_groups_select(call: CallbackQuery):
         return
     await safe_edit_text(
         call.message,
-        f"Отметьте группы для рассылки\nаккаунт ({acc['phone']}):",
+        f"Отметьте группы для рассылки\nаккаунт ({acc['phone']}):\n"
+        f"Максимум {config.MAX_GROUPS_PER_ACCOUNT} групп.",
         reply_markup=kb.groups_select_kb(index, acc["groups"], acc["selected"], page=0),
     )
 
@@ -796,10 +725,16 @@ async def cb_toggle_group(call: CallbackQuery):
     index, page, group_id = int(index_str), int(page_str), int(gid_str)
     acc = storage.get_account(call.from_user.id, index)
     selected = set(acc["selected"])
+    
     if group_id in selected:
         selected.discard(group_id)
     else:
+        # Проверка лимита групп
+        if len(selected) >= config.MAX_GROUPS_PER_ACCOUNT:
+            await call.answer(f"Максимум {config.MAX_GROUPS_PER_ACCOUNT} групп для отправки.", show_alert=True)
+            return
         selected.add(group_id)
+    
     storage.update_account(call.from_user.id, index, selected=list(selected))
     acc = storage.get_account(call.from_user.id, index)
     await safe_edit_reply_markup(
@@ -813,6 +748,12 @@ async def cb_groups_select_all(call: CallbackQuery):
     index, page = int(parts[-2]), int(parts[-1])
     acc = storage.get_account(call.from_user.id, index)
     all_ids = [g["id"] for g in acc["groups"]]
+    
+    # Проверка лимита групп
+    if len(all_ids) > config.MAX_GROUPS_PER_ACCOUNT:
+        await call.answer(f"Максимум {config.MAX_GROUPS_PER_ACCOUNT} групп для отправки. Доступно {len(all_ids)} групп.", show_alert=True)
+        return
+    
     storage.update_account(call.from_user.id, index, selected=all_ids)
     acc = storage.get_account(call.from_user.id, index)
     await safe_edit_reply_markup(
@@ -832,7 +773,6 @@ async def cb_groups_reset(call: CallbackQuery):
 
 
 # ---------- Контент (текст / фото / фото+текст / пересылка — на каждый аккаунт свой) ----------
-
 async def _show_content_menu(call: CallbackQuery, index: int):
     user = storage.get_user_data(call.from_user.id)
     acc = storage.get_account(call.from_user.id, index)
@@ -915,7 +855,7 @@ def _cleanup_photo_if_unused(user_id: int, account_index: int, new_content_type:
 @router.message(ContentStates.waiting_text)
 async def process_content_text(message: Message, state: FSMContext):
     text = message.html_text
-    if not spintext.validate(text):
+    if not spintax.validate(text):
         await message.answer("В шаблоне не совпадает количество { и } — проверьте и пришлите ещё раз.")
         return
     data = await state.get_data()
@@ -924,6 +864,7 @@ async def process_content_text(message: Message, state: FSMContext):
         content_type="text", content_text=text, content_photo=None,
         content_forward_chat_id=None, content_forward_message_id=None,
     )
+    storage.increment_function_usage("content_text")
     _cleanup_photo_if_unused(message.from_user.id, data["account_index"], "text")
     await state.clear()
     await message.answer("Текст сохранён ✅", reply_markup=kb.main_menu())
@@ -950,65 +891,39 @@ async def cb_content_set_phototext(call: CallbackQuery, state: FSMContext):
     await state.set_state(ContentStates.waiting_photo)
 
 
-@router.callback_query(F.data.startswith("content_set_forward_"))
-async def cb_content_set_forward(call: CallbackQuery, state: FSMContext):
-    index = int(call.data.rsplit("_", 1)[-1])
-    await state.update_data(account_index=index)
-    await safe_edit_text(
-        call.message,
-        "Перешлите сюда (Forward) сообщение, которое нужно рассылать пересылкой.\n\n"
-        "⚠️ Если отправитель ограничил пересылку своих сообщений, источник "
-        "определить не получится — тогда используйте текст/фото вместо пересылки.",
-        reply_markup=kb.cancel_button(),
-    )
-    await state.set_state(ContentStates.waiting_forward)
+# @router.callback_query(F.data.startswith("content_set_forward_"))
+# async def cb_content_set_forward(call: CallbackQuery, state: FSMContext):
+#     index = int(call.data.rsplit("_", 1)[-1])
+#     await state.update_data(account_index=index)
+#     await safe_edit_text(
+#         call.message,
+#         "Перешлите сюда (Forward) сообщение, которое нужно рассылать пересылкой.\n\n"
+#         "⚠️ Если отправитель ограничил пересылку своих сообщений, источник "
+#         "определить не получится — тогда используйте текст/фото вместо пересылки.",
+#         reply_markup=kb.cancel_button(),
+#     )
+#     await state.set_state(ContentStates.waiting_forward)
 
 
-@router.message(ContentStates.waiting_forward)
-async def process_content_forward(message: Message, state: FSMContext):
-    data = await state.get_data()
-    account_index = data["account_index"]
+# @router.message(ContentStates.waiting_forward)
+# async def process_content_forward(message: Message, state: FSMContext):
+#     chat_id, msg_id = _extract_forward_origin(message)
+#     if chat_id is None or msg_id is None:
+#         await message.answer(
+#             "Не удалось определить источник пересылки. Перешлите другое сообщение "
+#             "(из канала/группы, где пересылка не ограничена), либо используйте текст/фото."
+#         )
+#         return
+#     data = await state.get_data()
+#     storage.update_account(
+#         message.from_user.id, data["account_index"],
+#         content_type="forward", content_text=None, content_photo=None,
+#         content_forward_chat_id=chat_id, content_forward_message_id=msg_id,
+#     )
+#     _cleanup_photo_if_unused(message.from_user.id, data["account_index"], "forward")
+#     await state.clear()
+#     await message.answer("Пересылаемое сообщение сохранено ✅", reply_markup=kb.main_menu())
 
-    chat_id = None
-    msg_id = None
-
-    # 1. Сначала пробуем определить источник из пересылки
-    origin = _extract_forward_origin(message)
-    if origin[0] is not None:
-        chat_id, msg_id = origin
-    else:
-        # 2. Если пересылка не определена, проверяем, есть ли reply
-        if message.reply_to_message:
-            reply = message.reply_to_message
-            chat_id = reply.chat.id
-            msg_id = reply.message_id
-            await message.answer("✅ Источник определён через ответ (Reply).")
-        else:
-            await message.answer(
-                "⚠️ Не удалось определить источник.\n\n"
-                "Попробуйте один из способов:\n"
-                "1️⃣ Перешлите сообщение заново\n"
-                "2️⃣ Ответьте (Reply) на сообщение, которое хотите переслать\n"
-                "3️⃣ Используйте текст/фото вместо пересылки",
-                reply_markup=kb.cancel_button()
-            )
-            return
-
-    # Сохраняем источник в аккаунт
-    storage.update_account(
-        message.from_user.id, account_index,
-        content_type="forward",
-        content_forward_chat_id=chat_id,
-        content_forward_message_id=msg_id,
-        content_text=None,
-        content_photo=None,
-    )
-    _cleanup_photo_if_unused(message.from_user.id, account_index, "forward")
-    await state.clear()
-    await message.answer(
-        "✅ Пересылаемое сообщение сохранено (источник определён).",
-        reply_markup=kb.main_menu()
-    )
 
 async def _save_photo(message: Message, user_id: int, account_index: int) -> str:
     os.makedirs(config.MEDIA_DIR, exist_ok=True)
@@ -1030,13 +945,14 @@ async def process_content_photo(message: Message, state: FSMContext):
             content_type="photo", content_text=None, content_photo=path,
             content_forward_chat_id=None, content_forward_message_id=None,
         )
+        storage.increment_function_usage("content_photo")
         await state.clear()
         await message.answer("Фото сохранено ✅", reply_markup=kb.main_menu())
         return
 
     if message.caption:
         caption = message.html_text
-        if not spintext.validate(caption):
+        if not spintax.validate(caption):
             await message.answer("В подписи не совпадает количество { и } — пришлите фото с подписью ещё раз.")
             return
         storage.update_account(
@@ -1044,6 +960,7 @@ async def process_content_photo(message: Message, state: FSMContext):
             content_type="photo_text", content_text=caption, content_photo=path,
             content_forward_chat_id=None, content_forward_message_id=None,
         )
+        storage.increment_function_usage("content_photo_text")
         await state.clear()
         await message.answer("Фото и текст сохранены ✅", reply_markup=kb.main_menu())
         return
@@ -1061,7 +978,7 @@ async def process_content_photo_wrong_type(message: Message):
 @router.message(ContentStates.waiting_photo_caption)
 async def process_photo_caption(message: Message, state: FSMContext):
     text = message.html_text
-    if not spintext.validate(text):
+    if not spintax.validate(text):
         await message.answer("В шаблоне не совпадает количество { и } — пришлите текст ещё раз.")
         return
     data = await state.get_data()
@@ -1070,12 +987,12 @@ async def process_photo_caption(message: Message, state: FSMContext):
         content_type="photo_text", content_text=text, content_photo=data["photo_path"],
         content_forward_chat_id=None, content_forward_message_id=None,
     )
+    storage.increment_function_usage("content_photo_text")
     await state.clear()
     await message.answer("Фото и текст сохранены ✅", reply_markup=kb.main_menu())
 
 
 # ---------- Настройки ----------
-
 async def _show_settings_menu(call: CallbackQuery):
     user = storage.get_user_data(call.from_user.id)
     accounts = user["accounts"]
@@ -1091,7 +1008,7 @@ async def _show_settings_menu(call: CallbackQuery):
         text = "Выберите настройку:"
     else:
         acc = storage.get_account(call.from_user.id, selected_index)
-        text = f'Выберите настройку по номеру "{acc["phone"]}":'
+        text = f'Выберите настройку по номеру "{acc["phone"]}"'
     await safe_edit_text(
         call.message, text, reply_markup=kb.settings_menu(accounts, selected_index, len(user["broadcast_accounts"]))
     )
@@ -1132,13 +1049,12 @@ async def cb_settings_interval_set(call: CallbackQuery, state: FSMContext):
     await state.update_data(account_index=user["settings_account"])
     await safe_edit_text(
         call.message,
-        "Отправьте интервал в формате часы:минуты:секунды\n\n"
-        "📌 Фиксированный: 0:1:15 (раз в 1 минуту 15 секунд)\n"
-        "📌 Случайный: 0:1:15-0:1:20 (от 1:15 до 1:20 случайно)\n\n"
-        "Пример: 1:30:00 (раз в 1.5 часа)",
+        "Отправьте интервал в формате часы:минуты:секунды\nНапример: 1:15:10 "
+        "(раз в 1 час 15 минут 10 секунд)",
         reply_markup=kb.cancel_button(),
     )
     await state.set_state(SettingsStates.waiting_interval)
+
 
 @router.callback_query(F.data == "settings_interval_once")
 async def cb_settings_interval_once(call: CallbackQuery):
@@ -1161,34 +1077,18 @@ async def cb_settings_interval_once(call: CallbackQuery):
 
 @router.message(SettingsStates.waiting_interval)
 async def process_interval(message: Message, state: FSMContext):
-    interval_spec = parse_interval(message.text)
-    if interval_spec is None:
-        await message.answer(
-            "❌ Неверный формат.\n\n"
-            "📌 Фиксированный: 0:1:15\n"
-            "📌 Случайный: 0:1:15-0:1:20\n\n"
-            "Попробуйте ещё раз:"
-        )
+    seconds = parse_interval(message.text)
+    if seconds is None:
+        await message.answer("Неверный формат. Пришлите интервал как часы:минуты:секунды, например 1:15:10")
         return
-
     data = await state.get_data()
-    storage.update_account(message.from_user.id, data["account_index"], interval=interval_spec)
+    storage.update_account(message.from_user.id, data["account_index"], interval=seconds)
+    # Трекинг типа интервала
+    if seconds > 0:
+        storage.increment_function_usage("interval_fixed")
     await state.clear()
+    await message.answer(f"Интервал сохранён: {format_interval(seconds)} ✅", reply_markup=kb.main_menu())
 
-    # Красиво форматируем для ответа
-    if interval_spec["min"] == interval_spec["max"]:
-        h, rem = divmod(int(interval_spec["min"]), 3600)
-        m, s = divmod(rem, 60)
-        formatted = f"{h}:{m:02d}:{s:02d}"
-        await message.answer(f"✅ Интервал сохранён: {formatted}", reply_markup=kb.main_menu())
-    else:
-        h, rem = divmod(int(interval_spec["min"]), 3600)
-        m, s = divmod(rem, 60)
-        min_str = f"{h}:{m:02d}:{s:02d}"
-        h, rem = divmod(int(interval_spec["max"]), 3600)
-        m, s = divmod(rem, 60)
-        max_str = f"{h}:{m:02d}:{s:02d}"
-        await message.answer(f"✅ Интервал сохранён: {min_str}–{max_str} (случайный)", reply_markup=kb.main_menu())
 
 @router.callback_query(F.data == "settings_delay")
 async def cb_settings_delay(call: CallbackQuery):
@@ -1227,6 +1127,11 @@ async def process_delay(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     storage.update_account(message.from_user.id, data["account_index"], delay=spec)
+    # Трекинг типа паузы
+    if spec["min"] == spec["max"]:
+        storage.increment_function_usage("delay_fixed")
+    else:
+        storage.increment_function_usage("delay_random")
     await state.clear()
     await message.answer(f"Пауза сохранена: {format_delay_spec(spec)} ✅", reply_markup=kb.main_menu())
 
@@ -1286,7 +1191,6 @@ async def process_delay_between_accounts(message: Message, state: FSMContext):
 
 
 # ---------- Расписание рассылок (окно начало-конец, теперь в главном меню) ----------
-
 @router.callback_query(F.data == "menu_schedule")
 async def cb_menu_schedule(call: CallbackQuery):
     user = storage.get_user_data(call.from_user.id)
@@ -1389,49 +1293,7 @@ def _schedule_active_now(user: dict, now: datetime, hhmm: str) -> bool:
     return False
 
 
-def _extract_content_from_forward(message: Message) -> dict | None:
-    """
-    Извлекает содержимое из пересланного сообщения.
-    Возвращает словарь с ключами:
-    - type: "text" | "photo" | "photo_text" | None
-    - text: текст (если есть)
-    - photo_path: путь к сохранённому фото (если есть)
-    """
-    if message.forward_origin or message.forward_from_chat or message.forward_from:
-        # Это пересланное сообщение
-        content = {"type": None, "text": None, "photo_path": None}
-
-        # Текст (если есть)
-        if message.text or message.caption:
-            content["text"] = message.html_text or message.html_caption
-            content["type"] = "text"
-
-        # Фото (если есть)
-        if message.photo:
-            # Сохраняем фото во временную папку
-            os.makedirs(config.MEDIA_DIR, exist_ok=True)
-            # Используем временное имя
-            import tempfile
-            temp_path = os.path.join(config.MEDIA_DIR,
-                                     f"temp_forward_{message.from_user.id}_{int(datetime.now().timestamp())}.jpg")
-            message.bot.download(message.photo[-1], destination=temp_path)
-            content["photo_path"] = temp_path
-            if content["text"]:
-                content["type"] = "photo_text"
-            else:
-                content["type"] = "photo"
-
-        # Если ничего не найдено (например, документ) — возвращаем None
-        if content["type"] is None:
-            return None
-
-        return content
-
-    return None
-
-
 # ---------- Рассылка ----------
-
 def _eligible_broadcast_indices(user: dict) -> list[int]:
     result = []
     for idx in user["broadcast_accounts"]:
@@ -1510,27 +1372,9 @@ async def _account_broadcast_loop(user_id: int, account_index: int, start_offset
         await _send_once_for_account(user_id, account_index, bot)
 
         acc = storage.get_account(user_id, account_index)
-        interval_spec = acc.get("interval")
-        if not interval_spec:
+        interval = acc["interval"] if acc else None
+        if not interval:
             return
-        min_interval = interval_spec.get("min", 0)
-        max_interval = interval_spec.get("max", min_interval)
-
-        if not interval_spec:
-            return
-
-        # Поддержка старого формата (число) и нового (словарь с min/max)
-        if isinstance(interval_spec, (int, float)):
-            interval_spec = {"min": interval_spec, "max": interval_spec}
-
-        min_interval = interval_spec.get("min", 0)
-        max_interval = interval_spec.get("max", min_interval)
-
-        if max_interval > min_interval:
-            interval = random.uniform(min_interval, max_interval)
-        else:
-            interval = min_interval
-
         await asyncio.sleep(interval)
 
 
@@ -1639,6 +1483,7 @@ async def cb_schedule_start(call: CallbackQuery):
         return
 
     storage.update_user_data(user_id, schedule_enabled=True)
+    storage.increment_function_usage("schedule_start")
 
     now = now_msk()
     hhmm = now.strftime("%H:%M")
@@ -1684,39 +1529,212 @@ async def cb_broadcast_stop(call: CallbackQuery):
         await call.answer("Рассылка не запущена", show_alert=True)
 
 
+# ---------- Админ панель ----------
+@router.message(F.text == "/admin")
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет доступа к админ панели.")
+        return
+    
+    new_users = storage.count_new_users("all")
+    await message.answer(
+        "🔧 Админ панель",
+        reply_markup=kb.admin_menu(new_users)
+    )
+
+
+@router.callback_query(F.data == "admin_menu")
+async def cb_admin_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("У вас нет доступа к админ панели.", show_alert=True)
+        return
+    
+    new_users = storage.count_new_users("all")
+    await safe_edit_text(call.message, "🔧 Админ панель", reply_markup=kb.admin_menu(new_users))
+
+
+@router.callback_query(F.data == "admin_new_users")
+async def cb_admin_new_users(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("У вас нет доступа к админ панели.", show_alert=True)
+        return
+    
+    day = storage.count_new_users("day")
+    week = storage.count_new_users("week")
+    month = storage.count_new_users("month")
+    total = storage.count_new_users("all")
+    
+    text = (
+        f"📊 Новые пользователи:\n\n"
+        f"📅 За сегодня: {day}\n"
+        f"📆 За неделю: {week}\n"
+        f"🗓 За месяц: {month}\n"
+        f"👥 Всего: {total}"
+    )
+    await safe_edit_text(call.message, text, reply_markup=kb.admin_menu(total))
+
+
+@router.callback_query(F.data == "admin_broadcast")
+async def cb_admin_broadcast(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("У вас нет доступа к админ панели.", show_alert=True)
+        return
+    
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="admin_menu")
+    await safe_edit_text(
+        call.message,
+        "Отправьте сообщение для рассылки всем пользователям:",
+        reply_markup=b.as_markup()
+    )
+    await state.set_state(AdminStates.waiting_broadcast_message)
+
+
+@router.message(AdminStates.waiting_broadcast_message)
+async def process_admin_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет доступа к админ панели.")
+        await state.clear()
+        return
+    
+    user_ids = storage.all_bot_user_ids()
+    sent = 0
+    failed = 0
+    
+    for user_id in user_ids:
+        try:
+            if message.photo:
+                await message.bot.send_photo(user_id, message.photo[-1].file_id, caption=message.html_text, parse_mode="HTML")
+            elif message.text:
+                await message.bot.send_message(user_id, message.html_text, parse_mode="HTML")
+            sent += 1
+        except Exception:
+            failed += 1
+    
+    await state.clear()
+    await message.answer(
+        f"Рассылка завершена:\n✅ Отправлено: {sent}\n❌ Ошибок: {failed}",
+        reply_markup=kb.admin_menu(storage.count_new_users("all"))
+    )
+
+
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("У вас нет доступа к админ панели.", show_alert=True)
+        return
+    
+    storage.update_accounts_distribution()
+    func_stats = storage.get_function_usage_stats()
+    acc_dist = storage.get_accounts_distribution()
+    
+    text = (
+        "📊 Статистика использования функций:\n\n"
+        f"🕐 Рассылка по времени: {func_stats.get('schedule_start', 0)}\n"
+        f"✏️ Контент - текст: {func_stats.get('content_text', 0)}\n"
+        f"🖼 Контент - фото: {func_stats.get('content_photo', 0)}\n"
+        f"🖼📝 Контент - фото+текст: {func_stats.get('content_photo_text', 0)}\n"
+        f"⏱ Интервал - обычный: {func_stats.get('interval_fixed', 0)}\n"
+        f"🎲 Интервал - рандом: {func_stats.get('interval_random', 0)}\n"
+        f"⏸ Пауза между группами - обычная: {func_stats.get('delay_fixed', 0)}\n"
+        f"🎲 Пауза между группами - рандом: {func_stats.get('delay_random', 0)}\n\n"
+        "👥 Распределение по количеству аккаунтов:\n"
+        f"1 аккаунт: {acc_dist.get('1_account', 0)}\n"
+        f"2 аккаунта: {acc_dist.get('2_accounts', 0)}\n"
+        f"3 аккаунта: {acc_dist.get('3_accounts', 0)}"
+    )
+    await safe_edit_text(call.message, text, reply_markup=kb.admin_menu(storage.count_new_users("all")))
+
+
+@router.callback_query(F.data == "admin_maintenance")
+async def cb_admin_maintenance(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("У вас нет доступа к админ панели.", show_alert=True)
+        return
+    
+    is_enabled = storage.is_maintenance_mode()
+    status = "🔴 ВКЛЮЧЁН" if is_enabled else "🟢 ВЫКЛЮЧЕН"
+    await safe_edit_text(
+        call.message,
+        f"🔧 Режим тех работ: {status}\n\n"
+        "В этом режиме пользователи не могут использовать бота.",
+        reply_markup=kb.admin_maintenance_kb(is_enabled)
+    )
+
+
+@router.callback_query(F.data == "admin_toggle_maintenance")
+async def cb_admin_toggle_maintenance(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("У вас нет доступа к админ панели.", show_alert=True)
+        return
+    
+    current = storage.is_maintenance_mode()
+    storage.set_maintenance_mode(not current)
+    
+    new_status = "🔴 ВКЛЮЧЁН" if not current else "🟢 ВЫКЛЮЧЕН"
+    await safe_edit_text(
+        call.message,
+        f"🔧 Режим тех работ: {new_status}\n\n"
+        "В этом режиме пользователи не могут использовать бота.",
+        reply_markup=kb.admin_maintenance_kb(not current)
+    )
+
+
 # ---------- Планировщик расписания (окна времени) ----------
-
 async def scheduler_loop(bot: Bot):
+    logger.info("[Scheduler] Планировщик ЗАПУЩЕН")
     while True:
-        now = now_msk()
-        hhmm = now.strftime("%H:%M")
+        try:
+            now = now_msk()
+            hhmm = now.strftime("%H:%M")
+            logger.info(f"[Scheduler] Проверка расписания: {hhmm} МСК")
 
-        for user_id in config.ALLOWED_USER_IDS:
-            user = storage.get_user_data(user_id)
-            if not user.get("schedule_enabled") or not user["schedule"]:
-                continue
+            # Получаем всех пользователей, которые хотя бы раз запускали бота
+            all_users = storage.all_bot_user_ids()
+            logger.info(f"[Scheduler] Всего пользователей: {len(all_users)}")
 
-            should_run = _schedule_active_now(user, now, hhmm)
-            currently_running = _is_running(user_id)
+            for user_id in all_users:
+                user = storage.get_user_data(user_id)
+                if not user:
+                    continue
 
-            if should_run and not currently_running:
-                indices = _eligible_broadcast_indices(user)
-                if indices:
-                    _launch_tasks(user_id, indices, bot)
-            elif not should_run and currently_running:
-                for t in running_tasks.get(user_id, []):
-                    if not t.done():
-                        t.cancel()
-                running_tasks.pop(user_id, None)
+                schedule_enabled = user.get("schedule_enabled", False)
+                has_schedule = bool(user.get("schedule"))
+                
+                logger.info(f"[Scheduler] User {user_id}: schedule_enabled={schedule_enabled}, has_schedule={has_schedule}")
+                
+                if not schedule_enabled or not has_schedule:
+                    continue
 
-        await asyncio.sleep(config.SCHEDULER_CHECK_INTERVAL)
+                should_run = _schedule_active_now(user, now, hhmm)
+                currently_running = _is_running(user_id)
+                
+                logger.info(f"[Scheduler] User {user_id}: should_run={should_run}, currently_running={currently_running}")
+
+                if should_run and not currently_running:
+                    indices = _eligible_broadcast_indices(user)
+                    logger.info(f"[Scheduler] User {user_id}: eligible_indices={indices}")
+                    if indices:
+                        logger.info(f"[Scheduler] User {user_id}: ЗАПУСКАЕМ рассылку по расписанию")
+                        _launch_tasks(user_id, indices, bot)
+                elif not should_run and currently_running:
+                    logger.info(f"[Scheduler] User {user_id}: ОСТАНАВЛИВАЕМ рассылку (вне окна)")
+                    for t in running_tasks.get(user_id, []):
+                        if not t.done():
+                            t.cancel()
+                    running_tasks.pop(user_id, None)
+
+            await asyncio.sleep(config.SCHEDULER_CHECK_INTERVAL)
+        except Exception as e:
+            logger.error(f"[Scheduler] Ошибка: {e}")
+            await asyncio.sleep(config.SCHEDULER_CHECK_INTERVAL)
 
 
 async def _startup_session_check(bot: Bot):
     """При запуске бота проверяем все сохранённые аккаунты: если сессия была
     отозвана вручную (через Устройства в Telegram), пока бот не работал —
     сразу же чистим её, а не ждём первой попытки рассылки."""
-    for user_id in config.ALLOWED_USER_IDS:
+    for user_id in storage.all_bot_user_ids():
         user = storage.get_user_data(user_id)
         for acc in list(user["accounts"]):
             key = storage.session_key(user_id, acc["index"])
