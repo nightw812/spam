@@ -44,7 +44,6 @@ def cancel_button() -> InlineKeyboardMarkup:
 
 
 # ---------- аккаунты ----------
-
 def account_menu(accounts: list[dict], broadcast_indices: list[int]) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     multi = len(accounts) > 1
@@ -73,7 +72,6 @@ def account_remove_list_kb(accounts: list[dict]) -> InlineKeyboardMarkup:
 
 
 # ---------- выбор аккаунта (используется группами и контентом, когда их 2+) ----------
-
 def account_picker_kb(accounts: list[dict], prefix: str, back_cb: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for acc in accounts:
@@ -84,7 +82,6 @@ def account_picker_kb(accounts: list[dict], prefix: str, back_cb: str) -> Inline
 
 
 # ---------- группы ----------
-
 def groups_menu(index: int, back_target: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     _btn(b, "🔄 загрузить группы", "load", callback_data=f"groups_load_{index}")
@@ -134,20 +131,18 @@ def groups_select_kb(index: int, groups: list[dict], selected: list[int], page: 
 
 
 # ---------- контент (на каждый аккаунт отдельно) ----------
-
 def content_menu(index: int, back_target: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     _btn(b, "✏️ текст", "text", callback_data=f"content_set_text_{index}")
     _btn(b, "🖼 фото", "photo", callback_data=f"content_set_photo_{index}")
     _btn(b, "🖼📝 фото + текст", "phototext", callback_data=f"content_set_phototext_{index}")
-    _btn(b, "↪️ пересылка", "forward", callback_data=f"content_set_forward_{index}")
+    # _btn(b, "↪️ пересылка", "forward", callback_data=f"content_set_forward_{index}")  # Временно отключено
     _btn(b, f"{plain('back')} назад", "back", callback_data=back_target)
     b.adjust(1)
     return b.as_markup()
 
 
 # ---------- настройки ----------
-
 def settings_menu(accounts: list[dict], selected_index, broadcast_count: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     row_sizes = []
@@ -198,7 +193,6 @@ def delay_between_accounts_kb() -> InlineKeyboardMarkup:
 
 
 # ---------- расписание (окна времени: начало-конец) ----------
-
 def schedule_menu(entries: list[dict], enabled: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for e in entries:
@@ -222,4 +216,25 @@ def schedule_days_kb(selected_days: list[int]) -> InlineKeyboardMarkup:
     b.button(text="➡️ дальше (время)", callback_data="schedule_days_done")
     _btn(b, f"{plain('cancel')} отмена", "cancel", callback_data="menu_schedule")
     b.adjust(4, 3, 1, 1)
+    return b.as_markup()
+
+
+# ---------- Админ панель ----------
+def admin_menu(new_users_count: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text=f"👥 Новых пользователей: {new_users_count}", callback_data="admin_new_users")
+    b.button(text="📢 Отправить всем", callback_data="admin_broadcast")
+    b.button(text="📊 Статистика", callback_data="admin_stats")
+    b.button(text="🔧 Тех работы", callback_data="admin_maintenance")
+    _btn(b, f"{plain('back')} назад", "back", callback_data="menu_main")
+    b.adjust(2, 2, 1)
+    return b.as_markup()
+
+
+def admin_maintenance_kb(is_enabled: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    status = "🔴 ВЫКЛЮЧИТЬ" if is_enabled else "🟢 ВКЛЮЧИТЬ"
+    b.button(text=status, callback_data="admin_toggle_maintenance")
+    _btn(b, f"{plain('back')} назад", "back", callback_data="admin_menu")
+    b.adjust(1)
     return b.as_markup()
